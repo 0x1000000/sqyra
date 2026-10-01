@@ -6,6 +6,7 @@ import {
   type ColumnRef,
   type SqlType,
   type TableMetadata,
+  type TableDescriptor,
 } from "../descriptors/index.js";
 import {
   normalizeExportOptions,
@@ -73,6 +74,141 @@ export interface TableScript {
 }
 
 type Metadata = TableMetadata<string | null, string, ColumnDefinitions, string>;
+export interface SchemaScript {
+  create(): TableScriptCommand;
+}
+
+/** Creates all tables before adding foreign keys; SQLite keeps inline constraints. */
+export function schemaScript(
+  tables: ReadonlyArray<TableDescriptor<string | null, string, ColumnDefinitions, string>>,
+): SchemaScript {
+  if (tables == null) throw new TypeError("Schema table list cannot be null.");
+  const byName = new Map<string, Metadata>();
+  for (const table of tables) {
+    if (table == null) throw new TypeError("Schema table list cannot contain null.");
+    const metadata = table.$metadata;
+    const key = metadataKey(metadata);
+    if (byName.has(key)) throw new TypeError(`Duplicate schema table '${metadata.name}'.`);
+    if (metadata.temporary) throw new TypeError("Schema creation requires permanent tables.");
+    byName.set(key, metadata);
+  }
+  return Object.freeze({
+    create: () =>
+      Object.freeze({
+        kind: "create" as const,
+        toSql: (input: SqlDialect | InlineExportOptions): string => {
+          const options = normalizeExportOptions(input);
+          const physicalNames = new Set<string>();
+          const prepared = [...byName.values()].map((metadata) => {
+            const physical = tableName(metadata, options.dialect, options);
+            if (physicalNames.has(physical.toUpperCase()))
+              throw new TypeError(`Duplicate physical schema table '${physical}'.`);
+            physicalNames.add(physical.toUpperCase());
+            const groups = collectForeignKeys(metadata, true);
+            for (const group of groups) {
+              const target = byName.get(
+                metadataKey({
+                  database: group.origin.database,
+                  schema: group.origin.schema,
+                  name: group.origin.table,
+                }),
+              );
+              if (target === undefined)
+                throw new TypeError(
+                  `Foreign key on '${metadata.name}' references table '${group.origin.table}' which is not included in the schema.`,
+                );
+              group.origin = {
+                database: target.database,
+                schema: target.schema,
+                table: target.name,
+              };
+              for (const pair of group.pairs) {
+                const column = Object.keys(target.columns).find(
+                  (name) => name.toUpperCase() === pair.foreign.toUpperCase(),
+                );
+                if (column === undefined)
+                  throw new TypeError(
+                    `Referenced column '${target.name}.${pair.foreign}' was not found.`,
+                  );
+                pair.foreign = column;
+              }
+            }
+            return {
+              metadata,
+              physical,
+              constraints: groups.map((group) => foreignKeySql(metadata, group, options, true)),
+            };
+          });
+          const creates = prepared.map(({ metadata, constraints }) =>
+            render(metadata, "create", options, options.dialect === "sqlite" ? constraints : []),
+          );
+          const alters =
+            options.dialect === "sqlite"
+              ? []
+              : prepared.flatMap(({ physical, constraints }) =>
+                  constraints.map((constraint) => `ALTER TABLE ${physical} ADD ${constraint};`),
+                );
+          return creates.concat(alters).join("");
+        },
+      }),
+  });
+}
+
+const metadataKey = (metadata: Pick<Metadata, "database" | "schema" | "name">) =>
+  JSON.stringify(
+    [metadata.database ?? "", metadata.schema ?? "", metadata.name].map((part) =>
+      part.toUpperCase(),
+    ),
+  );
+
+interface ForeignKeyGroup {
+  origin: NonNullable<ReturnType<typeof getColumnOrigin>>;
+  readonly pairs: Array<{ local: string; foreign: string }>;
+}
+function collectForeignKeys(metadata: Metadata, canonicalNames = false): ForeignKeyGroup[] {
+  const groups = new Map<string, ForeignKeyGroup>();
+  for (const [local, definition] of Object.entries(metadata.definitions)) {
+    const configured = definition.options.references;
+    if (configured === undefined) continue;
+    for (const item of Array.isArray(configured) ? configured : [configured]) {
+      const reference = typeof item === "function" ? item() : item;
+      const origin = getColumnOrigin(reference);
+      if (origin === undefined)
+        throw new TypeError(`Foreign key '${local}' must reference a physical table column.`);
+      const key = canonicalNames
+        ? metadataKey({ database: origin.database, schema: origin.schema, name: origin.table })
+        : `${origin.database ?? ""}\0${origin.schema ?? ""}\0${origin.table}`;
+      const group = groups.get(key) ?? { origin, pairs: [] };
+      group.pairs.push({ local, foreign: reference.name });
+      groups.set(key, group);
+    }
+  }
+  return [...groups.values()];
+}
+function foreignKeySql(
+  metadata: Metadata,
+  group: ForeignKeyGroup,
+  options: ExportOptions,
+  useTargetSchema = false,
+): string {
+  const schema = mappedSchema(metadata, options);
+  const schemaPrefix = schema === null ? "" : `${schema}__`;
+  const foreignMetadata = {
+    ...metadata,
+    database: group.origin.database,
+    schema: group.origin.schema,
+    name: group.origin.table,
+  };
+  const targetSchema = mappedSchema(foreignMetadata, options);
+  const targetPrefix = useTargetSchema
+    ? targetSchema === null
+      ? ""
+      : `${targetSchema}__`
+    : schemaPrefix;
+  const fkName = `FK_${schemaPrefix}${metadata.name}_to_${targetPrefix}${group.origin.table}`;
+  const dialect = options.dialect;
+  return `CONSTRAINT ${quote(fkName, dialect)} FOREIGN KEY (${group.pairs.map((p) => quote(p.local, dialect)).join(",")}) REFERENCES ${tableName(foreignMetadata, dialect, options)}(${group.pairs.map((p) => quote(p.foreign, dialect)).join(",")})`;
+}
 export function createTableScript(metadata: Metadata): TableScript {
   const command = (kind: TableScriptCommand["kind"]): TableScriptCommand =>
     Object.freeze({
@@ -194,6 +330,7 @@ function render(
   metadata: Metadata,
   kind: TableScriptCommand["kind"],
   options: ExportOptions,
+  foreignConstraints?: ReadonlyArray<string>,
 ): string {
   const dialect = options.dialect;
   const physicalName =
@@ -241,42 +378,9 @@ function render(
       `${constraint}PRIMARY KEY (${primary.map(([name]) => quote(name, dialect)).join(",")})`,
     );
   }
-  const foreignGroups = new Map<
-    string,
-    {
-      readonly origin: NonNullable<ReturnType<typeof getColumnOrigin>>;
-      readonly pairs: Array<{ local: string; foreign: string }>;
-    }
-  >();
-  for (const [local, definition] of Object.entries(metadata.definitions)) {
-    const configured = definition.options.references;
-    if (configured === undefined) continue;
-    const references = Array.isArray(configured) ? configured : [configured];
-    for (const item of references) {
-      const reference = typeof item === "function" ? item() : item;
-      const origin = getColumnOrigin(reference);
-      if (origin === undefined)
-        throw new TypeError(`Foreign key '${local}' must reference a physical table column.`);
-      const key = `${origin.database ?? ""}\0${origin.schema ?? ""}\0${origin.table}`;
-      const group = foreignGroups.get(key) ?? { origin, pairs: [] };
-      group.pairs.push({ local, foreign: reference.name });
-      foreignGroups.set(key, group);
-    }
-  }
-  for (const group of foreignGroups.values()) {
-    const schema = mappedSchema(metadata, options);
-    const schemaPrefix = schema === null ? "" : `${schema}__`;
-    const fkName = `FK_${schemaPrefix}${metadata.name}_to_${schemaPrefix}${group.origin.table}`;
-    const foreignMetadata = {
-      ...metadata,
-      database: group.origin.database,
-      schema: group.origin.schema,
-      name: group.origin.table,
-    };
-    columns.push(
-      `CONSTRAINT ${quote(fkName, dialect)} FOREIGN KEY (${group.pairs.map((p) => quote(p.local, dialect)).join(",")}) REFERENCES ${tableName(foreignMetadata, dialect, options)}(${group.pairs.map((p) => quote(p.foreign, dialect)).join(",")})`,
-    );
-  }
+  for (const constraint of foreignConstraints ??
+    collectForeignKeys(metadata).map((group) => foreignKeySql(metadata, group, options)))
+    columns.push(constraint);
   const inlineIndexes =
     dialect === "tsql" || dialect === "mysql"
       ? metadata.indexes.map((item) => {

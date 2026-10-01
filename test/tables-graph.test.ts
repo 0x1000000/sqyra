@@ -5,6 +5,7 @@ import {
   createColumnRef,
   defineTable,
   deleteFrom,
+  nullableColumn,
   select,
   sqlType,
   tableSource,
@@ -380,28 +381,83 @@ describe("SqExpress table graph port", () => {
     expect(graph.tryToJoinTables(self(), self())).toBe(null);
   });
 
-  it("TryCreate_Cycle_ReturnsFalse and Create_InvalidGraph_Throws", () => {
-    const a = defineTable({
-      schema: null,
-      name: "A",
+  it("TryCreate_SqExpressForeignKeyTables_IncludingCycle_PreservesReferencesAndSupportsJoins", () => {
+    const fk0 = defineTable({ schema: "dbo", name: "Fk0", columns: { Id: column(sqlType.int32) } });
+    const fk1A = defineTable({
+      schema: "dbo",
+      name: "Fk1A",
+      columns: { Id: column(sqlType.int32), Parent: column(sqlType.int32, { references: fk0.Id }) },
+    });
+    const fk1B = defineTable({
+      schema: "dbo",
+      name: "Fk1B",
+      columns: { Id: column(sqlType.int32), Parent: column(sqlType.int32, { references: fk0.Id }) },
+    });
+    const fk2AB = defineTable({
+      schema: "dbo",
+      name: "Fk2AB",
       columns: {
         Id: column(sqlType.int32),
-        RefId: column(sqlType.int32, {
+        Parent0: column(sqlType.int32, { references: fk0.Id }),
+        ParentA: column(sqlType.int32, { references: fk1A.Id }),
+        ParentB: column(sqlType.int32, { references: fk1B.Id }),
+      },
+    });
+    const fk3AB = defineTable({
+      schema: "dbo",
+      name: "Fk3AB",
+      columns: {
+        Id: column(sqlType.int32),
+        Parent0: column(sqlType.int32, { references: fk0.Id }),
+        ParentA: column(sqlType.int32, { references: [fk1A.Id, fk2AB.ParentA] }),
+        ParentB: column(sqlType.int32, { references: [fk1B.Id, fk2AB.ParentB] }),
+      },
+    });
+    const a = defineTable({
+      schema: "dbo",
+      name: "FkCycleA",
+      columns: {
+        Id: column(sqlType.int32),
+        FkCycleBId: nullableColumn(sqlType.int32, {
           references: () =>
-            createColumnRef("Id", "B", false, { database: null, schema: null, table: "B" }),
+            createColumnRef("Id", "FkCycleB", false, {
+              database: null,
+              schema: "dbo",
+              table: "FkCycleB",
+            }),
         }),
       },
     });
     const b = defineTable({
-      schema: null,
-      name: "B",
-      columns: { Id: column(sqlType.int32), RefId: column(sqlType.int32, { references: a.Id }) },
+      schema: "dbo",
+      name: "FkCycleB",
+      columns: {
+        Id: column(sqlType.int32),
+        FkCycleAId: nullableColumn(sqlType.int32, { references: a.Id }),
+      },
     });
-    expect(tryTablesGraph([a, b])).toMatchObject({
-      success: false,
-      error: "Cycle detected in tables graph.",
-    });
-    expect(() => tablesGraph([a, b])).toThrow("Cycle detected");
+    const result = tryTablesGraph([fk0, fk1A, fk1B, fk2AB, fk3AB, a, b]);
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error(result.error);
+
+    const graph = result.graph;
+    expect(graph.getReferences(fk1A)).toEqual([fk0]);
+    expect(graph.getReferences(fk2AB)).toEqual([fk0, fk1A, fk1B]);
+    expect(graph.getReferences(fk3AB)).toEqual([fk0, fk1A, fk2AB, fk1B]);
+    expect(graph.getReferences(a)).toEqual([b]);
+    expect(graph.getReferences(b)).toEqual([a]);
+    expect(graph.getReferencedBy(a)).toEqual([b]);
+    expect(graph.getReferencedBy(b)).toEqual([a]);
+    expect([...graph.getAllReferences(a)]).toEqual([b, a]);
+    expect([...graph.getAllReferencedBy(a)]).toEqual([b, a]);
+    expect(graph.tryToJoinTables(a(), fk0())).toBe(null);
+    expect(() => tablesGraph([fk0, fk1A, fk1B, fk2AB, fk3AB, a, b])).not.toThrow();
+    expect(toSql(graph.toJoinTables(a("a"), b("b")), "tsql")).toBe(
+      "[dbo].[FkCycleA] [a] JOIN [dbo].[FkCycleB] [b] ON [a].[FkCycleBId]=[b].[Id]",
+    );
+    expect(toSql(graph.toJoinTables(b("b"), a("a")), "tsql")).toBe(
+      "[dbo].[FkCycleB] [b] JOIN [dbo].[FkCycleA] [a] ON [b].[FkCycleAId]=[a].[Id]",
+    );
   });
 
   it("TryCreate_ForeignKeyOutsideGraph_ReturnsFalse", () => {

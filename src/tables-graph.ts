@@ -26,9 +26,34 @@ export const AmbiguousJoinPathBehavior = {
 } as const;
 export type AmbiguousJoinPathBehavior =
   (typeof AmbiguousJoinPathBehavior)[keyof typeof AmbiguousJoinPathBehavior];
+export const AmbiguousForeignKeyBehavior = {
+  PreferForward: "prefer-forward",
+  Fail: "fail",
+  Callback: "callback",
+} as const;
+export type AmbiguousForeignKeyBehavior =
+  (typeof AmbiguousForeignKeyBehavior)[keyof typeof AmbiguousForeignKeyBehavior];
+export interface GraphForeignKeyRelationship {
+  readonly source: GraphTable;
+  readonly target: GraphTable;
+  readonly columnPairs: ReadonlyArray<{ readonly source: string; readonly target: string }>;
+}
 export interface TablesGraphJoinOptions {
   readonly ambiguousPathBehavior?: AmbiguousJoinPathBehavior;
   readonly ambiguousPathResolver?: (paths: ReadonlyArray<ReadonlyArray<GraphTable>>) => number;
+  readonly ambiguousForeignKeyBehavior?: AmbiguousForeignKeyBehavior;
+  readonly ambiguousForeignKeyResolver?: (
+    relationships: ReadonlyArray<GraphForeignKeyRelationship>,
+  ) => number;
+}
+// One fixed budget for the entire join request, including checkpoints and join trees.
+class SearchWork {
+  private remaining = 10_000;
+  consume(count = 1): void {
+    this.remaining -= count;
+    if (this.remaining < 0)
+      throw new TypeError("Table graph search exceeded its work limit (10,000 steps).");
+  }
 }
 export type TablesGraphCreateResult =
   | { readonly success: true; readonly graph: TablesGraph; readonly error: null }
@@ -128,21 +153,7 @@ export class TablesGraph {
       }
       links.set(sourceKey, Object.freeze(tableLinks) as ForeignKeyLink[]);
     }
-    const indegree = new Map([...canonical.keys()].map((tableKey) => [tableKey, 0]));
-    for (const [sourceKey, targets] of outgoing)
-      for (const target of targets)
-        if (sourceKey !== key(target)) indegree.set(key(target), indegree.get(key(target))! + 1);
-    const queue = [...canonical.keys()].filter((tableKey) => indegree.get(tableKey) === 0);
-    for (let index = 0; index < queue.length; index++) {
-      const sourceKey = queue[index]!;
-      for (const target of outgoing.get(sourceKey) ?? []) {
-        const targetKey = key(target);
-        if (targetKey === sourceKey) continue;
-        indegree.set(targetKey, indegree.get(targetKey)! - 1);
-        if (indegree.get(targetKey) === 0) queue.push(targetKey);
-      }
-    }
-    if (queue.length !== canonical.size) return fail("Cycle detected in tables graph.");
+    // Cyclic foreign keys are valid; navigation and join search track visited tables.
     for (const items of [...outgoing.values(), ...incoming.values()]) Object.freeze(items);
     return {
       success: true,
@@ -209,9 +220,10 @@ export class TablesGraph {
     checkpointsOrOptions?: ReadonlyArray<GraphTableReference> | TablesGraphJoinOptions | null,
     options: TablesGraphJoinOptions = {},
   ): IExprTableSource | null {
+    const work = new SearchWork();
     if (Array.isArray(first) || first == null) {
       const settings = this.validateOptions(lastOrOptions as TablesGraphJoinOptions | undefined);
-      return this.joinMany(first as ReadonlyArray<GraphTableReference> | null, settings);
+      return this.joinMany(first as ReadonlyArray<GraphTableReference> | null, settings, work);
     }
     const last = lastOrOptions as GraphTableReference;
     const checkpoints = Array.isArray(checkpointsOrOptions) ? checkpointsOrOptions : [];
@@ -226,22 +238,27 @@ export class TablesGraph {
     let from = actualTable(source) as IExprTableSource;
     let previousActual = from as ExprTable;
     for (const endpoint of [...checkpoints, last]) {
+      work.consume();
       if (!this.contains(endpoint)) return null;
       const path = this.selectPath(
-        this.shortestPaths([key(previous)], new Set([key(endpoint)]), settings),
+        this.shortestPaths([key(previous)], new Set([key(endpoint)]), settings, work),
         settings,
       );
       if (path === null) return null;
       for (let index = 1; index < path.length; index++) {
         const current = path[index]!;
         const currentActual = actualTable(index === path.length - 1 ? endpoint : current());
-        from = this.join(
+        const joined = this.join(
           from,
           previousActual,
           this.tables.get(key(previous))!,
           currentActual,
           current,
+          settings,
+          work,
         );
+        if (joined === null) return null;
+        from = joined;
         previous = current;
         previousActual = currentActual;
       }
@@ -325,19 +342,35 @@ export class TablesGraph {
       typeof options.ambiguousPathResolver !== "function"
     )
       throw new TypeError("An ambiguous join path resolver is required for Callback behavior.");
-    return { ...options, ambiguousPathBehavior: behavior };
+    const foreignBehavior =
+      options.ambiguousForeignKeyBehavior ?? AmbiguousForeignKeyBehavior.PreferForward;
+    if (!Object.values(AmbiguousForeignKeyBehavior).includes(foreignBehavior))
+      throw new TypeError("Invalid ambiguous foreign key behavior.");
+    if (
+      foreignBehavior === AmbiguousForeignKeyBehavior.Callback &&
+      typeof options.ambiguousForeignKeyResolver !== "function"
+    )
+      throw new TypeError("An ambiguous foreign key resolver is required for Callback behavior.");
+    return {
+      ...options,
+      ambiguousPathBehavior: behavior,
+      ambiguousForeignKeyBehavior: foreignBehavior,
+    };
   }
   private shortestPaths(
     sources: ReadonlyArray<string>,
     targets: ReadonlySet<string>,
     options: TablesGraphJoinOptions,
+    work: SearchWork,
   ): ReadonlyArray<ReadonlyArray<GraphTable>> {
     const queue = [...new Set(sources)];
+    work.consume(sources.length);
     const distance = new Map(queue.map((source) => [source, 0]));
     const previous = new Map(queue.map((source) => [source, [] as string[]]));
     const reached: string[] = [];
     let targetDistance: number | undefined;
     for (let index = 0; index < queue.length; index++) {
+      work.consume();
       const current = queue[index]!;
       const currentDistance = distance.get(current)!;
       if (targetDistance !== undefined && currentDistance > targetDistance) break;
@@ -346,17 +379,21 @@ export class TablesGraph {
         reached.push(current);
         continue;
       }
-      const canonical = this.tables.get(current)!;
-      const neighbors = [...this.getReferences(canonical), ...this.getReferencedBy(canonical)];
-      for (const neighborKey of new Set(neighbors.map(key))) {
-        const nextDistance = currentDistance + 1;
-        if (!distance.has(neighborKey)) {
-          distance.set(neighborKey, nextDistance);
-          previous.set(neighborKey, [current]);
-          queue.push(neighborKey);
-        } else if (distance.get(neighborKey) === nextDistance)
-          previous.get(neighborKey)!.push(current);
-      }
+      const seen = new Set<string>();
+      for (const neighbors of [this.outgoing.get(current) ?? [], this.incoming.get(current) ?? []])
+        for (const neighbor of neighbors) {
+          work.consume();
+          const neighborKey = key(neighbor);
+          if (neighborKey === current || seen.has(neighborKey)) continue;
+          seen.add(neighborKey);
+          const nextDistance = currentDistance + 1;
+          if (!distance.has(neighborKey)) {
+            distance.set(neighborKey, nextDistance);
+            previous.set(neighborKey, [current]);
+            queue.push(neighborKey);
+          } else if (distance.get(neighborKey) === nextDistance)
+            previous.get(neighborKey)!.push(current);
+        }
     }
     const maxPaths =
       options.ambiguousPathBehavior === AmbiguousJoinPathBehavior.Callback
@@ -365,19 +402,27 @@ export class TablesGraph {
           ? 2
           : 1;
     const paths: GraphTable[][] = [];
-    const reconstruct = (current: string, reversed: GraphTable[]): void => {
-      reversed.push(this.tables.get(current)!);
-      const parents = previous.get(current)!;
-      if (parents.length === 0) paths.push([...reversed].reverse());
-      else
-        for (const parent of parents) {
-          if (paths.length >= maxPaths) break;
-          reconstruct(parent, reversed);
-        }
-      reversed.pop();
-    };
     for (const target of reached) {
-      reconstruct(target, []);
+      const stack = [{ key: target, nextParent: 0 }];
+      const reversed = [this.tables.get(target)!];
+      while (stack.length > 0 && paths.length < maxPaths) {
+        work.consume();
+        const frame = stack[stack.length - 1]!;
+        const parents = previous.get(frame.key)!;
+        if (parents.length === 0) {
+          work.consume(reversed.length);
+          paths.push([...reversed].reverse());
+          stack.pop();
+          reversed.pop();
+        } else if (frame.nextParent === parents.length) {
+          stack.pop();
+          reversed.pop();
+        } else {
+          const parent = parents[frame.nextParent++]!;
+          stack.push({ key: parent, nextParent: 0 });
+          reversed.push(this.tables.get(parent)!);
+        }
+      }
       if (paths.length >= maxPaths) break;
     }
     return paths.map((path) => Object.freeze(path));
@@ -404,12 +449,51 @@ export class TablesGraph {
     leftCanonical: GraphTable,
     right: ExprTable,
     rightCanonical: GraphTable,
-  ): IExprTableSource {
+    options: TablesGraphJoinOptions,
+    work: SearchWork,
+  ): IExprTableSource | null {
+    const matching = (child: GraphTable, parent: GraphTable) =>
+      (this.links.get(key(child)) ?? []).filter((link) => {
+        work.consume();
+        return link.targetKey === key(parent);
+      });
+    const forward = matching(leftCanonical, rightCanonical);
+    const backward = matching(rightCanonical, leftCanonical);
+    let useForward = forward.length > 0;
+    if (forward.length > 0 && backward.length > 0) {
+      if (options.ambiguousForeignKeyBehavior === AmbiguousForeignKeyBehavior.Fail) return null;
+      if (options.ambiguousForeignKeyBehavior === AmbiguousForeignKeyBehavior.Callback) {
+        const relationship = (
+          source: GraphTable,
+          target: GraphTable,
+          links: ReadonlyArray<ForeignKeyLink>,
+        ): GraphForeignKeyRelationship =>
+          Object.freeze({
+            source,
+            target,
+            columnPairs: Object.freeze(
+              links.map((link) =>
+                Object.freeze({ source: link.childColumn, target: link.targetColumn }),
+              ),
+            ),
+          });
+        const candidates = Object.freeze([
+          relationship(leftCanonical, rightCanonical, forward),
+          relationship(rightCanonical, leftCanonical, backward),
+        ]);
+        const selected = options.ambiguousForeignKeyResolver!(candidates);
+        if (!Number.isInteger(selected) || selected < 0 || selected >= candidates.length)
+          throw new TypeError(
+            "The ambiguous foreign key resolver returned an invalid candidate index.",
+          );
+        useForward = selected === 0;
+      }
+    }
     const conditions = (
-      child: GraphTable,
       parent: GraphTable,
       actualChild: ExprTable,
       actualParent: ExprTable,
+      links: ReadonlyArray<ForeignKeyLink>,
     ): ExprBoolean | null => {
       let result: ExprBoolean | null = null;
       const retarget = (columnName: string, actual: ExprTable) =>
@@ -426,11 +510,12 @@ export class TablesGraph {
             }),
           columnName: exprColumnName({ name: columnName }),
         });
-      for (const link of this.links.get(key(child)) ?? []) {
-        if (link.targetKey !== key(parent)) continue;
-        const targetColumn = Object.keys(parent.$metadata.columns).find(
-          (columnName) => columnName.toUpperCase() === link.targetColumn.toUpperCase(),
-        );
+      for (const link of links) {
+        work.consume();
+        const targetColumn = Object.keys(parent.$metadata.columns).find((columnName) => {
+          work.consume();
+          return columnName.toUpperCase() === link.targetColumn.toUpperCase();
+        });
         if (targetColumn === undefined)
           throw new TypeError(
             `Referenced column '${name(parent)}.${link.targetColumn}' was not found.`,
@@ -443,20 +528,22 @@ export class TablesGraph {
       }
       return result;
     };
-    const condition =
-      conditions(leftCanonical, rightCanonical, left, right) ??
-      conditions(rightCanonical, leftCanonical, right, left);
+    const condition = useForward
+      ? conditions(rightCanonical, left, right, forward)
+      : conditions(leftCanonical, right, left, backward);
     if (condition === null) throw new TypeError("No foreign key join condition was found.");
     return exprJoinedTable({ left: from, right, searchCondition: condition, joinType: "Inner" });
   }
   private joinMany(
     tables: ReadonlyArray<GraphTableReference> | null,
     options: TablesGraphJoinOptions,
+    work: SearchWork,
   ): IExprTableSource | null {
     if (tables == null || tables.length === 0) return null;
     const actual = new Map<string, ExprTable>();
     const requested: string[] = [];
     for (const table of tables) {
+      work.consume();
       if (!this.contains(table) || actual.has(key(table))) return null;
       const tableKey = key(table);
       actual.set(tableKey, actualTable(table));
@@ -466,7 +553,7 @@ export class TablesGraph {
     const pending = new Set(requested.slice(1));
     let from: IExprTableSource = actual.get(tree[0]!)!;
     while (pending.size > 0) {
-      const path = this.selectPath(this.shortestPaths(tree, pending, options), options);
+      const path = this.selectPath(this.shortestPaths(tree, pending, options, work), options);
       if (path === null) return null;
       for (let index = 1; index < path.length; index++) {
         const parent = path[index - 1]!;
@@ -474,7 +561,17 @@ export class TablesGraph {
         const currentKey = key(current);
         const right = actual.get(currentKey) ?? actualTable(current());
         actual.set(currentKey, right);
-        from = this.join(from, actual.get(key(parent))!, parent, right, current);
+        const joined = this.join(
+          from,
+          actual.get(key(parent))!,
+          parent,
+          right,
+          current,
+          options,
+          work,
+        );
+        if (joined === null) return null;
+        from = joined;
         if (!tree.includes(currentKey)) tree.push(currentKey);
         pending.delete(currentKey);
       }

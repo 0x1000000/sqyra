@@ -1,6 +1,7 @@
 import type { InlineExportOptions } from "sqyra";
 import { defineIntegrationTables, recreateTables } from "../tables.js";
 import type { Scenario } from "./types.js";
+import { verifyCyclicSchema } from "./cyclic-schema.js";
 
 export const createTablesScenario: Scenario = {
   source: "ScCreateTables",
@@ -16,5 +17,6 @@ export const createTablesScenario: Scenario = {
         : { schemaMap: context.database.schemaMap }),
     };
     await recreateTables(tables.ordered, context.database, options);
+    await verifyCyclicSchema(context, options);
   },
 };
